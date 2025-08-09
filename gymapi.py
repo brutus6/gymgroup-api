@@ -1,166 +1,235 @@
-import requests
-import json
-import logging
 import sys
+import os
+import json
+import time
+import yaml
+import requests
+import http.cookiejar as cookiejar
 from requests.compat import urljoin
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------- Paths (next to script) ----------
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE_COOKIES = os.path.join(HERE, "gym_api_state.lwp")
+STATE_INFO    = os.path.join(HERE, "gym_api_info.json")
 
-# =========================================================================== #
+# ---------- Tuning ----------
+CACHE_TTL_SECONDS = 900        # 15 minutes
+MIN_LOGIN_RETRY_SECONDS = 300  # avoid hammering login on repeated failures
 
 class GymGroupAPI:
-
-    # ----------------------------------------------------------------------- #
-
     BASE_URL = 'https://thegymgroup.netpulse.com/np/'
     ENDPOINT_LOGIN = 'exerciser/login'
-    STATE_FILE = 'state.json'
-    REQ_HEADERS = {
+    HEADERS = {
         'Accept': 'application/json',
-        'Accept-Encoding': 'gzip',
-        'Connection': 'Keep-Alive',
-        'User-Agent': 'okhttp/3.12.3',
+        'User-Agent': 'okhttp/4.12.0',
         'X-NP-API-Version': '1.5',
-        'X-NP-App-Version': '5.0',
-        "X-NP-User-Agent": "clientType=MOBILE_DEVICE; " \
-                "devicePlatform=ANDROID; " \
-                "deviceUid=; " \
-                "applicationName=The Gym Group; " \
-                "applicationVersion=5.0; " \
-                "applicationVersionCode=38"
+        'X-NP-App-Version': '9999.0',
+        "X-NP-User-Agent": (
+            "clientType=MOBILE_DEVICE; "
+            "devicePlatform=ANDROID; "
+            "deviceUid=; "
+            "applicationName=The Gym Group; "
+            "applicationVersion=9999.0; "
+            "applicationVersionCode=999999"
+        )
     }
-
-    # ----------------------------------------------------------------------- #
 
     def __init__(self, username, password):
         self.username   = username
         self.password   = password
         self.user_id    = None
         self.home_gym   = None
-        self.api_sess   = requests.session()
-        self.api_sess.headers = self.REQ_HEADERS
+        self.etag       = None
+        self.last_value = None
+        self.last_ts    = 0.0
+        self.last_login_attempt = 0.0
 
-        if not self._load_state():
-            logger.debug("State file didn't exist or failed to load")
-            if not self.login():
-                logger.error("Authentication failed! Check credentials.")
+        self.session = requests.Session()
+        self.session.headers.update(self._strip_accept_encoding(self.HEADERS))
 
-    # ----------------------------------------------------------------------- #
+        # --- Silent HTTP retry adapter (handles brief blips without noise) ---
+        retries = Retry(
+            total=2,
+            backoff_factor=0.5,  # ~0.5s then ~1s
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"])
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
-    def _api_req(self, method, endpoint, data=None, retry_on_auth_fail=True):
-        if method != 'POST' and method !='GET':
-            logger.error("Invalid HTTP method specified to _api_req!")
-            return False
-
-        final_url = urljoin(self.BASE_URL, endpoint)
-        logger.debug(f"API {method} to URL '{final_url}'..")
-
+        # Persist cookies with domain/path
+        self.session.cookies = cookiejar.LWPCookieJar(STATE_COOKIES)
         try:
-            if method.upper() == 'POST':
-                response = self.api_sess.post(final_url, data=data)
-                response.raise_for_status()
-            elif method.upper() == 'GET':
-                response = self.api_sess.get(final_url)
-                response.raise_for_status()
-        except requests.exceptions.HTTPError as exc:
-            logger.error(f"HTTP error {response.status_code} on API " \
-                    f"{method} Error: {exc}")
-            if response.status_code == 403 and retry_on_auth_fail:
-                logger.error("Server returned auth. failure, logging in..")
-                if not self.login():
-                    logger.error("Authentication retry failed!")
-                    return False
-                return self._api_req(method, endpoint, data, False)
-            return False
-        except requests.exceptions.ConnectionError as exc:
-            logger.error(f"Connection error on API {method}! Error: {exc}")
-            return False
-        except requests.exceptions.Timeout as exc:
-            logger.error(f"Timeout error on API {method}! Error: {exc}")
-            return False
-        except requests.exceptions.RequestException as exc:
-            logger.error(f"Misc. error on API {method}! Error: {exc}")
-            return False
+            self.session.cookies.load(ignore_discard=True, ignore_expires=False)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            # corrupted jar -> start fresh silently
+            self.session.cookies = cookiejar.LWPCookieJar(STATE_COOKIES)
 
-        logger.debug(f"API {method} to '{endpoint}' succeeded!")
-        logger.debug(f"Response: {response}")
+        self._load_info()
 
-        return response
+    @staticmethod
+    def _strip_accept_encoding(h):
+        h2 = dict(h)
+        h2.pop('Accept-Encoding', None)
+        return h2
 
-    # ----------------------------------------------------------------------- #
-
-    def _load_state(self):
+    # ----- State I/O -----
+    def _load_info(self):
         try:
-            with open(self.STATE_FILE, 'r') as file_handle:
-                state = json.load(file_handle)
-                self.api_sess.cookies.update(state['cookies'])
-                self.user_id  = state['login_resp']['uuid']
-                self.home_gym = state['login_resp']['homeClubUuid']
-                return True
-        except Exception as exc:
-            logger.error(f"Exception occurred loading cookie jar: {exc}")
+            with open(STATE_INFO, 'r') as f:
+                d = json.load(f)
+            self.user_id    = d.get('user_id')
+            self.home_gym   = d.get('home_gym')
+            self.etag       = d.get('etag')
+            self.last_value = d.get('last_value')
+            self.last_ts    = float(d.get('last_ts', 0))
+            self.last_login_attempt = float(d.get('last_login_attempt', 0))
+        except Exception:
+            self.user_id = self.home_gym = self.etag = None
+            self.last_value, self.last_ts, self.last_login_attempt = None, 0.0, 0.0
+
+    def _save_info(self):
+        try:
+            tmp = f"{STATE_INFO}.tmp"
+            payload = {
+                'user_id': self.user_id,
+                'home_gym': self.home_gym,
+                'etag': self.etag,
+                'last_value': self.last_value,
+                'last_ts': self.last_ts,
+                'last_login_attempt': self.last_login_attempt,
+            }
+            with open(tmp, 'w') as f:
+                json.dump(payload, f)
+            os.replace(tmp, STATE_INFO)
+            try:
+                os.chmod(STATE_INFO, 0o600)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _save_cookies(self):
+        try:
+            self.session.cookies.save(ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
+
+    # ----- HTTP -----
+    def _api(self, method, endpoint, *, headers=None, data=None, retry_auth=True):
+        url = urljoin(self.BASE_URL, endpoint)
+        try:
+            if method == 'GET':
+                resp = self.session.get(url, headers=headers, timeout=15)
+            else:
+                resp = self.session.post(url, data=data, headers=headers, timeout=15)
+            if resp.status_code in (401, 403) and retry_auth:
+                if self._maybe_login():
+                    return self._api(method, endpoint, headers=headers, data=data, retry_auth=False)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            raise Exception(str(e))
+
+    # ----- Auth -----
+    def _maybe_login(self):
+        now = time.time()
+        if now - self.last_login_attempt < MIN_LOGIN_RETRY_SECONDS:
             return False
-
-    # ----------------------------------------------------------------------- #
-
-    def _save_state(self, state):
-        with open(self.STATE_FILE, 'w') as file_handle:
-            json.dump(state, file_handle)
-
-    # ----------------------------------------------------------------------- #
+        self.last_login_attempt = now
+        self._save_info()
+        return self.login()
 
     def login(self):
-        if not self.username or not self.password:
-            logger.error("Username or password were not specified!")
-            return False
-
-        logger.debug(f"Authenticating with username '{self.username}'")
-        response = self._api_req('POST', self.ENDPOINT_LOGIN, {
-            'username': self.username,
-            'password': self.password
-        })
-
-        if not response:
-            logger.error("There was a failure to log in!")
-            return False
-
         try:
-            resp_json = response.json()
-        except json.JSONDecodeError as exc:
-            logger.error(f"Login response was not valid JSON! Exc: {exc}")
+            resp = self._api('POST', self.ENDPOINT_LOGIN,
+                             data={'username': self.username, 'password': self.password},
+                             retry_auth=False)
+            info = resp.json()
+            self.user_id = info['uuid']
+            self.home_gym = info['homeClubUuid']
+            self._save_cookies()
+            self._save_info()
+            return True
+        except Exception:
             return False
 
-        self.user_id  = resp_json['uuid']
-        self.home_gym = resp_json['homeClubUuid']
+    # ----- API -----
+    def get_gym_occupancy(self):
+        now = time.time()
+        # Serve cached value if within TTL
+        if self.last_value is not None and (now - self.last_ts) < CACHE_TTL_SECONDS:
+            return self.last_value
 
-        logger.debug(f"Authenticated as UUID: {self.user_id}")
-        logger.debug(f"Storing cookies to disk..")
-        cookies = requests.utils.dict_from_cookiejar(self.api_sess.cookies)
+        if not self.user_id or not self.home_gym:
+            if not self._maybe_login():
+                if self.last_value is not None:
+                    return self.last_value
+                raise Exception("Login required and throttled/failed")
 
-        state = { 'cookies': cookies, 'login_resp': resp_json }
-        self._save_state(state)
+        endpoint = f"thegymgroup/v1.0/exerciser/{self.user_id}/gym-busyness?gymLocationId={self.home_gym}"
+        hdrs = {}
+        if self.etag:
+            hdrs['If-None-Match'] = self.etag
 
-        return True
+        resp = self._api('GET', endpoint, headers=hdrs)
 
-    # ----------------------------------------------------------------------- #
+        if resp.status_code == 304 and self.last_value is not None:
+            self.last_ts = now
+            self._save_info()
+            return self.last_value
 
-    def get_gym_occupancy(self, gym_uuid):
-        endpoint = f"thegymgroup/v1.0/exerciser/{self.user_id}/gym-busyness?" \
-                f"gymLocationId={gym_uuid}"
-        response = self._api_req('GET', endpoint)
+        data = resp.json()
 
-        if not response:
-            logger.error("Failed to retrieve gym occupancy!")
-            return False
-
+        # PEOPLE COUNT parsing (no clamping)
+        raw = data.get('currentCapacity')
         try:
-            resp_json = response.json()
-        except json.JSONDecodeError as exc:
-            logger.error(f"Gym occupancy response not valid JSON! Exc: {exc}")
-            return False
+            num = int(float(str(raw)))
+        except Exception:
+            num = None
 
-        logger.debug(f"Gym occupancy JSON: {json}")
-        return resp_json.get('currentCapacity')
+        new_etag = resp.headers.get('ETag') or resp.headers.get('Etag')
+        if new_etag:
+            self.etag = new_etag
 
-# =========================================================================== #
+        if num is not None:
+            self.last_value = num
+            self.last_ts = now
+            self._save_info()
+            return self.last_value
+
+        # if API response is weird, keep previous value if we have one
+        if self.last_value is not None:
+            self.last_ts = now
+            self._save_info()
+            return self.last_value
+
+        raise Exception("Occupancy missing and no cached value")
+
+# ----- Entry point -----
+if __name__ == "__main__":
+    secrets_path = '/config/secrets.yaml'
+    try:
+        with open(secrets_path) as f:
+            secrets = yaml.safe_load(f)
+        USERNAME = secrets['gym_group_username']
+        PASSWORD = secrets['gym_group_password']
+    except Exception as e:
+        print(f"Error: secrets problem: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    api = GymGroupAPI(USERNAME, PASSWORD)
+    try:
+        value = api.get_gym_occupancy()
+        print(value)  # stdout ONLY the number (HA-safe)
+    except Exception as e:
+        if api.last_value is not None:
+            print(api.last_value)  # final fallback: last known people count
+            sys.exit(0)
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
