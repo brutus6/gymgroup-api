@@ -1,3 +1,5 @@
+## README.md
+
 # Gym Group Python API (HA-friendly fork)
 
 This fork builds on the original project by **@joestanding** and focuses on being efficient, resilient, and friendly for continuous use — especially with **Home Assistant**.
@@ -30,7 +32,7 @@ Example command_line sensor in configuration.yaml:
 command_line:
   - sensor:
       name: "Gym Occupancy Raw"
-      command: "python3 /config/gym_occupancy.py"
+      command: "python3 /config/gymapi.py"
       unit_of_measurement: "people"
       scan_interval: 900
       value_template: "{{ value | int(0) }}"
