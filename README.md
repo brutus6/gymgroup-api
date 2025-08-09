@@ -1,50 +1,50 @@
-## README.md
-Gym Group Python API
-This script is a fork of the Gym Group Python API originally written by joestanding. It has been enhanced to be more efficient and resilient for continuous use, particularly in environments like Home Assistant.
+# Gym Group Python API (HA-friendly fork)
 
-## Overview
-This Python script interacts with The Gym Group's private API to retrieve the current occupancy of a specified home gym. It's designed to be run as a service or sensor, providing a real-time (or near real-time) count of how many people are in your gym.
+This fork builds on the original project by **@joestanding** and focuses on being efficient, resilient, and friendly for continuous use — especially with **Home Assistant**.
 
-## Key Features
-Efficient API Interaction: The script now caches session information, avoiding the need to log in on every execution.
+## What it does
 
-Request Caching: To reduce API calls, the script stores the last-known occupancy value and only requests new data after a set period.
+Fetches the **currentCapacity** (people count) for your **home gym** from The Gym Group’s private mobile API and prints **only a number** to stdout — ideal for HA `command_line` sensors.
 
-Automatic Re-authentication: The script can automatically detect an expired session and re-login without manual intervention.
+## Key improvements
 
-Robust Error Handling: It includes a retry mechanism for transient network issues and a graceful fallback to a cached value if a data fetch fails.
+- **Numeric-only output** for HA: stdout is only the people count; errors go to stderr.
+- **15-minute caching (TTL)**: avoids unnecessary API calls.
+- **Session reuse**: cookies + user IDs persisted; **login only when needed** (on 401/403).
+- **ETag support**: sends `If-None-Match` to allow `304 Not Modified`.
+- **Silent retries**: quick retry/backoff for transient 429/5xx/timeouts.
+- **Graceful fallback**: if the API hiccups, returns **last known value**.
 
-## Installation & Usage
-Clone the Repository:
+## Installation
 
-Bash
+bash
+git clone https://github.com/brutus6/gymgroup-api.git
+cd gymgroup-api
+pip install -r requirements.txt   # or: pip install requests PyYAML
 
-git clone [your repository URL]
-cd [your repository name]
-Install Dependencies:
-This script requires the requests and PyYAML libraries. You can install them using pip:
 
-Bash
+## Usage with Home Assistant
 
-pip install requests PyYAML
-Configure Credentials:
-You must create a secrets.yaml file in the same directory as the script. This file will store your Gym Group login details.
+Example command_line sensor in configuration.yaml:
 
-secrets.yaml should look like this:
+command_line:
+  - sensor:
+      name: "Gym Occupancy Raw"
+      command: "python3 /config/gym_occupancy.py"
+      unit_of_measurement: "people"
+      scan_interval: 900
+      value_template: "{{ value | int(0) }}"
 
-YAML
+## Configuration
 
-gym_group_username: "your_username"
-gym_group_password: "your_password"
-Note: If you are using this with Home Assistant, ensure the secrets_path variable in the script is correctly set to your Home Assistant configuration directory.
+Create a secrets.yaml file in your Home Assistant config directory with:
 
-Run the Script:
-You can run the script from your terminal:
+gym_group_username: "your_email@example.com"
+gym_group_password: "your_pin_or_password"
 
-Bash
-
-python your_script_name.py
-The script will print the current gym occupancy to standard output. Any errors will be printed to standard error.
+Update the secrets_path variable in the script if it’s not in /config/secrets.yaml.
 
 ## Contributing
-I welcome contributions to this project. If you have suggestions or improvements, please submit a pull request. This script was forked from the original work of joestanding.
+
+I welcome contributions to this project. If you have suggestions or improvements, please submit a pull request. This script was forked from the original work of  **@joestanding**.
+
